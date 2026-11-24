@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+inenv/
+include/
+dist/
+dist-build/
+test-build/
+build/
+# IDEs
+.vscode/
+.idea/
+# OS
+.DS_Store
+thumbs.db
+# Project specific
+python-version
+python-version.txt
+venv.zip
+client/profiles/
