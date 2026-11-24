@@ -24,3 +24,8 @@ python-version
 python-version.txt
 venv.zip
 client/profiles/
+*.json.tmp
+*.log
+.env
+# Rust
+server/target/

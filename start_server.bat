@@ -1,9 +1,9 @@
 @echo off
 cd /d "%~dp0"
-if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" "server\serve.py"
+if exist "server\target\release\nochat-server.exe" (
+    "server\target\release\nochat-server.exe"
 ) else (
-    python "server\serve.py"
+    cargo run --release --manifest-path "server\Cargo.toml"
 )
 pause
 

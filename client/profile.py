@@ -1,8 +1,11 @@
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import re
+import threading
+from typing import Any
 
 from cryptography.exceptions import InvalidTag
 
@@ -38,6 +41,12 @@ class Profile:
     storage_key: bytes
     contacts: dict[str, str] = field(default_factory=dict)
     last_recipient_b64: str | None = None
+    chats: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    avatar: str = ""
+    bio: str = ""
+    show_online_status: bool = True
+    peer_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     def add_contact(self, contact_name: str, public_key_b64: str) -> str:
         """Validiert den Public Key und speichert den Kontakt im Profil."""
@@ -46,41 +55,109 @@ class Profile:
             raise ValueError("Kontaktname darf nicht leer sein.")
         parse_public_key_b64(public_key_b64)
         clean_key = public_key_b64.strip()
-        self.contacts[clean_name] = clean_key
-        save_profile(self)
+        with self._lock:
+            self.contacts[clean_name] = clean_key
+            save_profile(self)
         return clean_key
 
     def remove_contact(self, contact_name: str) -> bool:
         """Entfernt einen Kontakt anhand seines Namens."""
-        matched = self._find_contact_key_name(contact_name)
-        if matched is None:
-            return False
-        del self.contacts[matched]
-        save_profile(self)
-        return True
+        with self._lock:
+            matched = self._find_contact_key_name(contact_name)
+            if matched is None:
+                return False
+            del self.contacts[matched]
+            save_profile(self)
+            return True
 
     def contact_name_for_key(self, public_key_b64: str) -> str | None:
         """Sucht den Kontaktnamen zu einem Public Key."""
         clean_key = public_key_b64.strip()
-        for name, stored_key in self.contacts.items():
-            if stored_key == clean_key:
-                return name
+        with self._lock:
+            for name, stored_key in self.contacts.items():
+                if stored_key == clean_key:
+                    return name
         return None
 
     def resolve_recipient(self, name_or_key: str) -> tuple[str, str | None]:
         """Löst einen Kontaktnamen oder Public Key auf und gibt (key_b64, contact_name) zurück."""
         query = name_or_key.strip()
-        matched_name = self._find_contact_key_name(query)
-        if matched_name is not None:
-            return self.contacts[matched_name], matched_name
+        with self._lock:
+            matched_name = self._find_contact_key_name(query)
+            if matched_name is not None:
+                return self.contacts[matched_name], matched_name
 
         parse_public_key_b64(query)
         return query, self.contact_name_for_key(query)
 
     def set_last_recipient(self, recipient_b64: str | None) -> None:
         """Speichert den zuletzt verwendeten Empfänger im Profil."""
-        self.last_recipient_b64 = recipient_b64
-        save_profile(self)
+        with self._lock:
+            self.last_recipient_b64 = recipient_b64
+            save_profile(self)
+
+    def ensure_chat(self, peer_pub_b64: str) -> str:
+        """Stellt sicher, dass ein Chat-Verlauf für den Public Key existiert."""
+        parse_public_key_b64(peer_pub_b64)
+        clean_key = peer_pub_b64.strip()
+        with self._lock:
+            if clean_key not in self.chats:
+                self.chats[clean_key] = []
+                save_profile(self)
+        return clean_key
+
+    def append_message(
+        self,
+        peer_pub_b64: str,
+        sender: str,
+        text: str,
+        timestamp: str | None = None,
+    ) -> dict[str, str]:
+        """Fügt eine Nachricht zum verschlüsselten Chat-Verlauf hinzu."""
+        parse_public_key_b64(peer_pub_b64)
+        clean_key = peer_pub_b64.strip()
+        entry = {
+            "sender": sender,
+            "text": text,
+            "timestamp": timestamp or datetime.now().isoformat(timespec="seconds"),
+        }
+        with self._lock:
+            self.chats.setdefault(clean_key, []).append(entry)
+            save_profile(self)
+        return entry
+
+    def update_settings(self, avatar: str, bio: str, show_online_status: bool) -> None:
+        """Aktualisiert Profilbild, Beschreibung und Online-Status-Sichtbarkeit."""
+        with self._lock:
+            self.avatar = avatar.strip()
+            self.bio = bio.strip()[:300]
+            self.show_online_status = bool(show_online_status)
+            save_profile(self)
+
+    def export_public_profile(self) -> dict[str, Any]:
+        """Gibt die eigenen Profil-Infos für E2EE-Nachrichten zurück."""
+        with self._lock:
+            return {
+                "avatar": self.avatar,
+                "bio": self.bio,
+                "show_online_status": self.show_online_status,
+            }
+
+    def update_peer_profile(self, peer_pub_b64: str, info: dict[str, Any]) -> dict[str, Any]:
+        """Speichert oder aktualisiert Profil-Infos eines Chat-Partners."""
+        clean_key = peer_pub_b64.strip()
+        avatar = info.get("avatar", "")
+        bio = info.get("bio", "")
+        show_online = info.get("show_online_status", True)
+        normalized = {
+            "avatar": avatar if isinstance(avatar, str) else "",
+            "bio": bio[:300] if isinstance(bio, str) else "",
+            "show_online_status": bool(show_online),
+        }
+        with self._lock:
+            self.peer_profiles[clean_key] = normalized
+            save_profile(self)
+        return normalized
 
     def _find_contact_key_name(self, query: str) -> str | None:
         clean = query.strip()
@@ -191,6 +268,39 @@ def load_profile(path: Path, password: str) -> Profile:
     if not isinstance(last_recipient, str) or not last_recipient.strip():
         last_recipient = None
 
+    raw_chats = payload.get("chats", {})
+    chats: dict[str, list[dict[str, str]]] = {}
+    if isinstance(raw_chats, dict):
+        for peer_key, entries in raw_chats.items():
+            if isinstance(peer_key, str) and isinstance(entries, list):
+                valid_entries: list[dict[str, str]] = []
+                for item in entries:
+                    if (
+                        isinstance(item, dict)
+                        and isinstance(item.get("sender"), str)
+                        and isinstance(item.get("text"), str)
+                        and isinstance(item.get("timestamp"), str)
+                    ):
+                        valid_entries.append(
+                            {
+                                "sender": item["sender"],
+                                "text": item["text"],
+                                "timestamp": item["timestamp"],
+                            }
+                        )
+                chats[peer_key] = valid_entries
+
+    raw_peer_profiles = payload.get("peer_profiles", {})
+    peer_profiles: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_peer_profiles, dict):
+        for peer_key, info in raw_peer_profiles.items():
+            if isinstance(peer_key, str) and isinstance(info, dict):
+                peer_profiles[peer_key] = {
+                    "avatar": info.get("avatar", "") if isinstance(info.get("avatar"), str) else "",
+                    "bio": info.get("bio", "") if isinstance(info.get("bio"), str) else "",
+                    "show_online_status": bool(info.get("show_online_status", True)),
+                }
+
     return Profile(
         name=name,
         keypair=keypair,
@@ -199,34 +309,45 @@ def load_profile(path: Path, password: str) -> Profile:
         storage_key=storage_key,
         contacts=contacts,
         last_recipient_b64=last_recipient,
+        chats=chats,
+        avatar=payload.get("avatar", "") if isinstance(payload.get("avatar"), str) else "",
+        bio=payload.get("bio", "") if isinstance(payload.get("bio"), str) else "",
+        show_online_status=bool(payload.get("show_online_status", True)),
+        peer_profiles=peer_profiles,
     )
 
 
 def save_profile(profile: Profile) -> None:
     """Verschlüsselt das Profil und speichert es atomar auf der Festplatte."""
-    profile.file_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "private_key_b64": b64_encode(serialize_private_key(profile.keypair.private_key)),
-        "contacts": profile.contacts,
-        "last_recipient_b64": profile.last_recipient_b64,
-    }
-    plaintext = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    nonce, ciphertext = encrypt_bytes(
-        profile.storage_key,
-        plaintext,
-        associated_data=profile.name.encode("utf-8"),
-    )
+    with profile._lock:
+        profile.file_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "private_key_b64": b64_encode(serialize_private_key(profile.keypair.private_key)),
+            "contacts": profile.contacts,
+            "last_recipient_b64": profile.last_recipient_b64,
+            "chats": profile.chats,
+            "avatar": profile.avatar,
+            "bio": profile.bio,
+            "show_online_status": profile.show_online_status,
+            "peer_profiles": profile.peer_profiles,
+        }
+        plaintext = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        nonce, ciphertext = encrypt_bytes(
+            profile.storage_key,
+            plaintext,
+            associated_data=profile.name.encode("utf-8"),
+        )
 
-    envelope = {
-        "version": PROFILE_VERSION,
-        "name": profile.name,
-        "kdf": "pbkdf2-sha256",
-        "salt": b64_encode(profile.salt),
-        "nonce": b64_encode(nonce),
-        "ciphertext": b64_encode(ciphertext),
-    }
+        envelope = {
+            "version": PROFILE_VERSION,
+            "name": profile.name,
+            "kdf": "pbkdf2-sha256",
+            "salt": b64_encode(profile.salt),
+            "nonce": b64_encode(nonce),
+            "ciphertext": b64_encode(ciphertext),
+        }
 
-    tmp_path = profile.file_path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(envelope, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp_path, profile.file_path)
+        tmp_path = profile.file_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(envelope, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, profile.file_path)
 
